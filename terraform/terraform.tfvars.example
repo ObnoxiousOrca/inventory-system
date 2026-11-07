@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars (git-ignored) and fill in your values.
+aws_region  = "ap-south-1"
+project     = "inventory"
+alert_email = "you@example.com"          # REPLACE
+github_repo = "your-github-user/your-repo" # REPLACE
+# create_github_oidc_provider = false    # uncomment if your account already has the GitHub OIDC provider
+# acm_certificate_arn = "arn:aws:acm:..." # optional: enables HTTPS on the load balancer
+# desired_count = 0                      # scale to zero when not demoing to save cost

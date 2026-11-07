@@ -1,0 +1,51 @@
+# Local development stack. Run from the docker/ folder:
+#   docker compose up --build
+# API:            http://localhost:3000   (try GET /health)
+# DynamoDB Local: http://localhost:8000
+#
+# No SNS locally: SNS_TOPIC_ARN is empty, so low-stock alerts are only written to the logs.
+
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-sS", "--max-time", "2", "-o", "/dev/null", "http://localhost:8000/"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+
+  # One-shot job: creates the table in DynamoDB Local, then exits.
+  db-init:
+    build:
+      context: ../backend
+      dockerfile: ../docker/Dockerfile
+    command: ["node", "scripts/createTable.js"]
+    environment: &backend-env
+      NODE_ENV: development
+      PORT: "3000"
+      AWS_REGION: ap-south-1            # REPLACE if you use another region (any value works for local)
+      AWS_ACCESS_KEY_ID: local          # dummy credentials, only for DynamoDB Local
+      AWS_SECRET_ACCESS_KEY: local
+      DYNAMODB_ENDPOINT: http://dynamodb:8000
+      DYNAMODB_TABLE: inventory-products
+      SNS_TOPIC_ARN: ""                 # leave empty locally
+      CORS_ORIGINS: http://localhost:5173
+    depends_on:
+      dynamodb:
+        condition: service_healthy
+    restart: "no"
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: ../docker/Dockerfile
+    environment: *backend-env
+    ports:
+      - "3000:3000"
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
