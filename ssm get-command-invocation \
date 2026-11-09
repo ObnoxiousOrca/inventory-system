@@ -1,0 +1,49 @@
+{
+    "Command": {
+        "CommandId": "e5c49c31-685f-4910-9e7b-359894346006",
+        "DocumentName": "AWS-RunShellScript",
+        "DocumentVersion": "$DEFAULT",
+        "Comment": "",
+        "ExpiresAfter": "2026-11-09T09:01:23.974000+05:30",
+        "Parameters": {
+            "commands": [
+                "whoami",
+                "sudo mkdir -pv /opt/inventory",
+                "ls -ld /opt /opt/inventory",
+                "id"
+            ]
+        },
+        "InstanceIds": [
+            "i-08aff518487606e8a"
+        ],
+        "Targets": [],
+        "RequestedDateTime": "2026-11-09T07:01:23.974000+05:30",
+        "Status": "Pending",
+        "StatusDetails": "Pending",
+        "OutputS3Region": "ap-south-1",
+        "OutputS3BucketName": "",
+        "OutputS3KeyPrefix": "",
+        "MaxConcurrency": "50",
+        "MaxErrors": "0",
+        "TargetCount": 1,
+        "CompletedCount": 0,
+        "ErrorCount": 0,
+        "DeliveryTimedOutCount": 0,
+        "ServiceRole": "",
+        "NotificationConfig": {
+            "NotificationArn": "",
+            "NotificationEvents": [],
+            "NotificationType": ""
+        },
+        "CloudWatchOutputConfig": {
+            "CloudWatchLogGroupName": "",
+            "CloudWatchOutputEnabled": false
+        },
+        "TimeoutSeconds": 3600,
+        "AlarmConfiguration": {
+            "IgnorePollAlarmFailure": false,
+            "Alarms": []
+        },
+        "TriggeredAlarms": []
+    }
+}

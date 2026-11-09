@@ -1,0 +1,41 @@
+#!/bin/bash
+set -euo pipefail
+
+exec > >(tee -a /var/log/inventory-bootstrap.log | logger -t inventory-bootstrap -s 2>/dev/console) 2>&1
+
+dnf install -y docker awscli-2 curl
+systemctl enable --now docker
+systemctl enable --now amazon-ssm-agent
+
+compose_arch="x86_64"
+if [ "$(uname -m)" = "aarch64" ]; then
+  compose_arch="aarch64"
+fi
+
+install -d -m 0755 /usr/local/lib/docker/cli-plugins
+curl -fsSL "https://github.com/docker/compose/releases/download/v2.32.4/docker-compose-linux-$compose_arch" \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
+chmod 0755 /usr/local/lib/docker/cli-plugins/docker-compose
+
+install -d -m 0755 /opt/inventory
+echo '${compose_content}' | base64 -d > /opt/inventory/docker-compose.yml
+echo '${nginx_content}' | base64 -d > /opt/inventory/nginx.conf
+
+cat > /opt/inventory/.env <<'ENV'
+ECR_REPOSITORY_URL=${ecr_repository_url}
+IMAGE_TAG=bootstrap
+AWS_REGION=${aws_region}
+CLOUDWATCH_LOG_GROUP=${cloudwatch_log_group}
+ENV
+
+cat > /opt/inventory/backend.env <<'ENV'
+NODE_ENV=production
+PORT=3000
+AWS_REGION=${aws_region}
+DYNAMODB_TABLE=${dynamodb_table}
+SNS_TOPIC_ARN=${sns_topic_arn}
+LOG_LEVEL=info
+ENV
+
+cd /opt/inventory
+docker compose up -d nginx

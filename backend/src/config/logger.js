@@ -3,7 +3,7 @@
 const pino = require('pino');
 const config = require('./index');
 
-// JSON logs go to stdout; on ECS/Fargate the awslogs driver ships them to CloudWatch.
+// JSON logs go to stdout; the EC2 Docker awslogs driver ships them to CloudWatch.
 const logger = pino({
   level: config.logLevel,
   base: { service: 'inventory-backend' },

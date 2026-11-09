@@ -1,18 +1,16 @@
-output "api_url" {
-  description = "Backend base URL (set as VITE_API_URL for the frontend; use https:// once a certificate is configured)."
-  value       = "http://${aws_lb.api.dns_name}"
+output "ec2_instance_id" {
+  description = "Backend EC2 instance ID; use this for SSM and status checks."
+  value       = aws_instance.backend.id
 }
 
-output "frontend_url" {
-  value = "https://${aws_cloudfront_distribution.frontend.domain_name}"
+output "ec2_public_dns" {
+  description = "Public DNS name used by the frontend to call the backend API."
+  value       = aws_instance.backend.public_dns
 }
 
-output "frontend_bucket_name" {
-  value = aws_s3_bucket.frontend.bucket
-}
-
-output "frontend_distribution_id" {
-  value = aws_cloudfront_distribution.frontend.id
+output "ec2_public_ip" {
+  description = "Public IPv4 address of the backend instance."
+  value       = aws_instance.backend.public_ip
 }
 
 output "ecr_repository_name" {
@@ -23,20 +21,21 @@ output "ecr_repository_url" {
   value = aws_ecr_repository.backend.repository_url
 }
 
-output "ecs_cluster_name" {
-  value = aws_ecs_cluster.main.name
-}
-
-output "ecs_service_name" {
-  value = aws_ecs_service.backend.name
-}
-
-output "ecs_task_family" {
-  value = aws_ecs_task_definition.backend.family
+output "dynamodb_table_name" {
+  value = aws_dynamodb_table.products.name
 }
 
 output "sns_topic_arn" {
   value = aws_sns_topic.low_stock.arn
+}
+
+output "frontend_bucket_name" {
+  value = aws_s3_bucket.frontend.bucket
+}
+
+output "frontend_url" {
+  description = "HTTP URL for the public S3 static website."
+  value       = "http://${aws_s3_bucket_website_configuration.frontend.website_endpoint}"
 }
 
 output "github_actions_role_arn" {

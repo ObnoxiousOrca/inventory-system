@@ -1,8 +1,13 @@
 # Copy to terraform.tfvars (git-ignored) and fill in your values.
 aws_region  = "ap-south-1"
 project     = "inventory"
-alert_email = "you@example.com"          # REPLACE
-github_repo = "your-github-user/your-repo" # REPLACE
+alert_email = "you@example.com"             # REPLACE
+github_repo = "your-github-user/your-repo"  # REPLACE; do not include .git
 # create_github_oidc_provider = false    # uncomment if your account already has the GitHub OIDC provider
-# acm_certificate_arn = "arn:aws:acm:..." # optional: enables HTTPS on the load balancer
-# desired_count = 0                      # scale to zero when not demoing to save cost
+# instance_type = "t3.micro"             # Free Tier benefits depend on account eligibility
+# ami_id = ""                             # empty selects Amazon Linux 2023
+# ami_architecture = "x86_64"
+# root_volume_size = 12                   # encrypted gp3 GiB
+# admin_cidr = ""                         # optional SSH CIDR; prefer SSM Session Manager
+# ssh_key_name = ""                       # existing EC2 key pair, set with admin_cidr only
+# cloudwatch_log_retention_days = 14

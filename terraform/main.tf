@@ -25,8 +25,8 @@ provider "aws" {
 
 data "aws_caller_identity" "current" {}
 
-# Networking: uses the account's default VPC to keep the lab simple.
-# For production, build a dedicated VPC with private subnets and NAT / VPC endpoints.
+# Networking: uses a public subnet in the account's default VPC; no NAT Gateway is needed.
+# The instance has outbound internet access for ECR, SSM, package installs, and CloudWatch.
 data "aws_vpc" "default" {
   default = true
 }
@@ -93,39 +93,38 @@ resource "aws_sns_topic_subscription" "email" {
 
 # ---------------------------------------------------------------- Logging
 resource "aws_cloudwatch_log_group" "backend" {
+  # Retain this legacy name so a migration does not replace the existing log group/history.
   name              = "/ecs/${local.name}-backend"
-  retention_in_days = 14
+  retention_in_days = var.cloudwatch_log_retention_days
 }
 
-# ---------------------------------------------------------------- IAM for ECS
-data "aws_iam_policy_document" "ecs_assume" {
+# ---------------------------------------------------------------- IAM for EC2
+data "aws_iam_policy_document" "ec2_assume" {
   statement {
     actions = ["sts:AssumeRole"]
     principals {
       type        = "Service"
-      identifiers = ["ecs-tasks.amazonaws.com"]
+      identifiers = ["ec2.amazonaws.com"]
     }
   }
 }
 
-# Execution role: used by ECS itself to pull the image and write logs.
-resource "aws_iam_role" "task_execution" {
-  name               = "${local.name}-task-execution"
-  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+resource "aws_iam_role" "backend_instance" {
+  name               = "${local.name}-backend-instance"
+  assume_role_policy = data.aws_iam_policy_document.ec2_assume.json
 }
 
-resource "aws_iam_role_policy_attachment" "task_execution" {
-  role       = aws_iam_role.task_execution.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+resource "aws_iam_instance_profile" "backend" {
+  name = "${local.name}-backend"
+  role = aws_iam_role.backend_instance.name
 }
 
-# Task role: what the application code may do (least privilege: this table + this topic only).
-resource "aws_iam_role" "task" {
-  name               = "${local.name}-task"
-  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+resource "aws_iam_role_policy_attachment" "backend_ssm" {
+  role       = aws_iam_role.backend_instance.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-data "aws_iam_policy_document" "task" {
+data "aws_iam_policy_document" "backend_instance" {
   statement {
     actions = [
       "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
@@ -137,202 +136,145 @@ data "aws_iam_policy_document" "task" {
     actions   = ["sns:Publish"]
     resources = [aws_sns_topic.low_stock.arn]
   }
+  statement {
+    actions   = ["ecr:GetAuthorizationToken"]
+    resources = ["*"]
+  }
+  statement {
+    actions = [
+      "ecr:BatchCheckLayerAvailability",
+      "ecr:BatchGetImage",
+      "ecr:GetDownloadUrlForLayer",
+    ]
+    resources = [aws_ecr_repository.backend.arn]
+  }
+  statement {
+    actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = ["${aws_cloudwatch_log_group.backend.arn}:*"]
+  }
 }
 
-resource "aws_iam_role_policy" "task" {
-  role   = aws_iam_role.task.id
-  policy = data.aws_iam_policy_document.task.json
+resource "aws_iam_role_policy" "backend_instance" {
+  name   = "${local.name}-backend-instance"
+  role   = aws_iam_role.backend_instance.id
+  policy = data.aws_iam_policy_document.backend_instance.json
 }
 
-# ---------------------------------------------------------------- Security groups
-resource "aws_security_group" "alb" {
-  name_prefix = "${local.name}-alb-"
+# ---------------------------------------------------------------- EC2 backend
+data "aws_ami" "amazon_linux_2023" {
+  count       = var.ami_id == "" ? 1 : 0
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-2023.*-kernel-*-${var.ami_architecture}"]
+  }
+
+  filter {
+    name   = "architecture"
+    values = [var.ami_architecture]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+resource "aws_security_group" "backend_instance" {
+  name        = "${local.name}-backend"
+  description = "Allow public API traffic and outbound instance access"
   vpc_id      = data.aws_vpc.default.id
 
+  lifecycle {
+    # AWS does not allow an existing security group's description to be modified.
+    ignore_changes = [description]
+  }
+
   ingress {
+    description = "Public HTTP API traffic"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+
+  dynamic "ingress" {
+    for_each = var.admin_cidr == "" ? [] : [var.admin_cidr]
+    content {
+      description = "Optional SSH access for the configured administrator CIDR"
+      from_port   = 22
+      to_port     = 22
+      protocol    = "tcp"
+      cidr_blocks = [ingress.value]
+    }
   }
+
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
-  lifecycle { create_before_destroy = true }
 }
 
-# Containers only accept traffic from the load balancer.
-resource "aws_security_group" "service" {
-  name_prefix = "${local.name}-svc-"
-  vpc_id      = data.aws_vpc.default.id
+resource "aws_instance" "backend" {
+  ami                         = var.ami_id != "" ? var.ami_id : data.aws_ami.amazon_linux_2023[0].id
+  instance_type               = var.instance_type
+  key_name                    = var.ssh_key_name != "" ? var.ssh_key_name : null
+  subnet_id                   = data.aws_subnets.default.ids[0]
+  vpc_security_group_ids      = [aws_security_group.backend_instance.id]
+  associate_public_ip_address = true
+  iam_instance_profile        = aws_iam_instance_profile.backend.name
+  user_data = templatefile("${path.module}/../docker/ec2/cloud-init.sh.tftpl", {
+    compose_content      = base64encode(file("${path.module}/../docker/ec2/docker-compose.yml"))
+    nginx_content        = base64encode(file("${path.module}/../docker/ec2/nginx.conf"))
+    ecr_repository_url   = aws_ecr_repository.backend.repository_url
+    aws_region           = var.aws_region
+    dynamodb_table       = aws_dynamodb_table.products.name
+    sns_topic_arn        = aws_sns_topic.low_stock.arn
+    cloudwatch_log_group = aws_cloudwatch_log_group.backend.name
+  })
 
-  ingress {
-    from_port       = var.container_port
-    to_port         = var.container_port
-    protocol        = "tcp"
-    security_groups = [aws_security_group.alb.id]
-  }
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-  lifecycle { create_before_destroy = true }
-}
-
-# ---------------------------------------------------------------- Load balancer
-resource "aws_lb" "api" {
-  name               = "${local.name}-alb"
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb.id]
-  subnets            = data.aws_subnets.default.ids
-}
-
-resource "aws_lb_target_group" "api" {
-  name        = "${local.name}-tg"
-  port        = var.container_port
-  protocol    = "HTTP"
-  target_type = "ip" # required for Fargate (awsvpc networking)
-  vpc_id      = data.aws_vpc.default.id
-
-  health_check {
-    path                = "/health"
-    matcher             = "200"
-    interval            = 30
-    healthy_threshold   = 2
-    unhealthy_threshold = 3
-  }
-}
-
-locals {
-  https_enabled = var.acm_certificate_arn != ""
-}
-
-# With a certificate: HTTP redirects to HTTPS. Without: HTTP forwards directly (demo only).
-resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.api.arn
-  port              = 80
-  protocol          = "HTTP"
-
-  default_action {
-    type             = local.https_enabled ? "redirect" : "forward"
-    target_group_arn = local.https_enabled ? null : aws_lb_target_group.api.arn
-
-    dynamic "redirect" {
-      for_each = local.https_enabled ? [1] : []
-      content {
-        port        = "443"
-        protocol    = "HTTPS"
-        status_code = "HTTP_301"
-      }
-    }
-  }
-}
-
-resource "aws_lb_listener" "https" {
-  count             = local.https_enabled ? 1 : 0
-  load_balancer_arn = aws_lb.api.arn
-  port              = 443
-  protocol          = "HTTPS"
-  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
-  certificate_arn   = var.acm_certificate_arn
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.api.arn
-  }
-}
-
-# ---------------------------------------------------------------- ECS / Fargate
-resource "aws_ecs_cluster" "main" {
-  name = "${local.name}-cluster"
-}
-
-resource "aws_ecs_task_definition" "backend" {
-  family                   = "${local.name}-backend"
-  requires_compatibilities = ["FARGATE"]
-  network_mode             = "awsvpc"
-  cpu                      = var.task_cpu
-  memory                   = var.task_memory
-  execution_role_arn       = aws_iam_role.task_execution.arn
-  task_role_arn            = aws_iam_role.task.arn
-
-  container_definitions = jsonencode([{
-    name      = "backend" # must match CONTAINER_NAME in the GitHub Actions workflow
-    # First deploy uses :latest; CI/CD then registers revisions with the commit-SHA tag.
-    # NOTE: push an image to ECR before the service can start (see README).
-    image     = "${aws_ecr_repository.backend.repository_url}:latest"
-    essential = true
-    portMappings = [{ containerPort = var.container_port, protocol = "tcp" }]
-    environment = [
-      { name = "NODE_ENV", value = "production" },
-      { name = "PORT", value = tostring(var.container_port) },
-      { name = "AWS_REGION", value = var.aws_region },
-      { name = "DYNAMODB_TABLE", value = aws_dynamodb_table.products.name },
-      { name = "SNS_TOPIC_ARN", value = aws_sns_topic.low_stock.arn },
-      { name = "CORS_ORIGINS", value = var.cors_origins },
-    ]
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = {
-        "awslogs-group"         = aws_cloudwatch_log_group.backend.name
-        "awslogs-region"        = var.aws_region
-        "awslogs-stream-prefix" = "backend"
-      }
-    }
-  }])
-}
-
-resource "aws_ecs_service" "backend" {
-  name            = "${local.name}-backend-service"
-  cluster         = aws_ecs_cluster.main.id
-  task_definition = aws_ecs_task_definition.backend.arn
-  desired_count   = var.desired_count
-  launch_type     = "FARGATE"
-
-  network_configuration {
-    subnets          = data.aws_subnets.default.ids
-    security_groups  = [aws_security_group.service.id]
-    assign_public_ip = true # default VPC has no NAT; needed to pull from ECR. Use private subnets + NAT in production.
+  root_block_device {
+    volume_type           = "gp3"
+    volume_size           = var.root_volume_size
+    delete_on_termination = true
+    encrypted             = true
   }
 
-  load_balancer {
-    target_group_arn = aws_lb_target_group.api.arn
-    container_name   = "backend"
-    container_port   = var.container_port
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2
   }
 
-  # CI/CD registers new task definition revisions; don't let Terraform revert them.
-  lifecycle {
-    ignore_changes = [task_definition]
+  monitoring = false
+
+  tags = {
+    Name = "${local.name}-backend"
   }
 
-  depends_on = [aws_lb_listener.http]
+  depends_on = [
+    aws_iam_role_policy.backend_instance,
+    aws_iam_role_policy_attachment.backend_ssm,
+  ]
 }
 
-# ---------------------------------------------------------------- CloudWatch alarm (basic monitoring)
-resource "aws_cloudwatch_metric_alarm" "backend_5xx" {
-  alarm_name          = "${local.name}-backend-5xx"
-  namespace           = "AWS/ApplicationELB"
-  metric_name         = "HTTPCode_Target_5XX_Count"
-  statistic           = "Sum"
+# ---------------------------------------------------------------- CloudWatch alarm
+resource "aws_cloudwatch_metric_alarm" "backend_cpu" {
+  alarm_name          = "${local.name}-backend-cpu"
+  namespace           = "AWS/EC2"
+  metric_name         = "CPUUtilization"
+  statistic           = "Average"
   period              = 300
   evaluation_periods  = 1
-  threshold           = 5
+  threshold           = 80
   comparison_operator = "GreaterThanOrEqualToThreshold"
   treat_missing_data  = "notBreaching"
-  dimensions          = { LoadBalancer = aws_lb.api.arn_suffix }
-  alarm_actions       = [aws_sns_topic.low_stock.arn] # reuses the topic; create a separate ops topic if preferred
+  dimensions          = { InstanceId = aws_instance.backend.id }
+  alarm_actions       = [aws_sns_topic.low_stock.arn]
 }
 
 # ---------------------------------------------------------------- Frontend: S3 + CloudFront
@@ -344,86 +286,20 @@ resource "aws_s3_bucket" "frontend" {
 resource "aws_s3_bucket_public_access_block" "frontend" {
   bucket                  = aws_s3_bucket.frontend.id
   block_public_acls       = true
-  block_public_policy     = true
+  block_public_policy     = false
   ignore_public_acls      = true
-  restrict_public_buckets = true
+  restrict_public_buckets = false
 }
 
-resource "aws_cloudfront_origin_access_control" "frontend" {
-  name                              = "${local.name}-frontend-oac"
-  origin_access_control_origin_type = "s3"
-  signing_behavior                  = "always"
-  signing_protocol                  = "sigv4"
-}
+resource "aws_s3_bucket_website_configuration" "frontend" {
+  bucket = aws_s3_bucket.frontend.id
 
-resource "aws_cloudfront_distribution" "frontend" {
-  enabled             = true
-  default_root_object = "index.html"
-
-  origin {
-    domain_name              = aws_s3_bucket.frontend.bucket_regional_domain_name
-    origin_id                = "s3-frontend"
-    origin_access_control_id = aws_cloudfront_origin_access_control.frontend.id
+  index_document {
+    suffix = "index.html"
   }
 
-  origin {
-    domain_name = aws_lb.api.dns_name
-    origin_id   = "api-alb"
-
-    custom_origin_config {
-      http_port              = 80
-      https_port             = 443
-      origin_protocol_policy = "http-only"
-      origin_ssl_protocols   = ["TLSv1.2"]
-    }
-  }
-
-  ordered_cache_behavior {
-    path_pattern             = "/api/*"
-    target_origin_id         = "api-alb"
-    viewer_protocol_policy   = "redirect-to-https"
-    allowed_methods          = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
-    cached_methods           = ["GET", "HEAD"]
-    cache_policy_id          = aws_cloudfront_cache_policy.api.id
-    origin_request_policy_id = "b689b0a8-53d0-40ab-baf2-68738e2966ac"
-  }
-
-  default_cache_behavior {
-    target_origin_id       = "s3-frontend"
-    viewer_protocol_policy = "redirect-to-https"
-    allowed_methods        = ["GET", "HEAD"]
-    cached_methods         = ["GET", "HEAD"]
-    compress               = true
-    # AWS managed policy "CachingOptimized"
-    cache_policy_id = "658327ea-f89d-4fab-a63d-7e88639e58f6"
-  }
-
-  restrictions {
-    geo_restriction { restriction_type = "none" }
-  }
-
-  viewer_certificate {
-    cloudfront_default_certificate = true
-  }
-}
-
-resource "aws_cloudfront_cache_policy" "api" {
-  name        = "${local.name}-api-no-cache"
-  comment     = "Disable caching for inventory API requests"
-  min_ttl     = 0
-  default_ttl = 0
-  max_ttl     = 0
-
-  parameters_in_cache_key_and_forwarded_to_origin {
-    cookies_config {
-      cookie_behavior = "none"
-    }
-    headers_config {
-      header_behavior = "none"
-    }
-    query_strings_config {
-      query_string_behavior = "none"
-    }
+  error_document {
+    key = "index.html"
   }
 }
 
@@ -432,22 +308,29 @@ data "aws_iam_policy_document" "frontend_bucket" {
     actions   = ["s3:GetObject"]
     resources = ["${aws_s3_bucket.frontend.arn}/*"]
     principals {
-      type        = "Service"
-      identifiers = ["cloudfront.amazonaws.com"]
-    }
-    condition {
-      test     = "StringEquals"
-      variable = "AWS:SourceArn"
-      values   = [aws_cloudfront_distribution.frontend.arn]
+      type        = "AWS"
+      identifiers = ["*"]
     }
   }
 }
 
 resource "aws_s3_bucket_policy" "frontend" {
   bucket = aws_s3_bucket.frontend.id
-  policy = data.aws_iam_policy_document.frontend_bucket.json
-}
 
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = "*"
+      Action    = "s3:GetObject"
+      Resource  = "${aws_s3_bucket.frontend.arn}/*"
+    }]
+  })
+
+  depends_on = [
+    aws_s3_bucket_public_access_block.frontend
+  ]
+}
 # ---------------------------------------------------------------- GitHub Actions -> AWS (OIDC)
 resource "aws_iam_openid_connect_provider" "github" {
   count          = var.create_github_oidc_provider ? 1 : 0
@@ -499,24 +382,19 @@ data "aws_iam_policy_document" "github_deploy" {
     resources = [aws_ecr_repository.backend.arn]
   }
   statement {
-    actions   = ["ecs:DescribeTaskDefinition", "ecs:RegisterTaskDefinition"]
-    resources = ["*"] # these two ECS actions do not support resource-level restrictions
+    actions = ["ssm:SendCommand"]
+    resources = [
+      aws_instance.backend.arn,
+      "arn:aws:ssm:${var.aws_region}::document/AWS-RunShellScript",
+    ]
   }
   statement {
-    actions   = ["ecs:UpdateService", "ecs:DescribeServices"]
-    resources = [aws_ecs_service.backend.id]
+    actions   = ["ssm:GetCommandInvocation"]
+    resources = ["*"]
   }
   statement {
-    actions   = ["iam:PassRole"]
-    resources = [aws_iam_role.task.arn, aws_iam_role.task_execution.arn]
-  }
-  statement {
-    actions   = ["s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
+    actions   = ["s3:GetBucketLocation", "s3:ListBucket", "s3:PutObject", "s3:DeleteObject"]
     resources = [aws_s3_bucket.frontend.arn, "${aws_s3_bucket.frontend.arn}/*"]
-  }
-  statement {
-    actions   = ["cloudfront:CreateInvalidation"]
-    resources = [aws_cloudfront_distribution.frontend.arn]
   }
 }
 

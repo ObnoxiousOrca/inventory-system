@@ -1,26 +1,20 @@
 name: CI/CD
 
-# Runs tests on every push/PR; deploys only on pushes to main.
 on:
   push:
     branches: [main]
   pull_request:
 
-# Needed for GitHub -> AWS authentication via OIDC (no long-lived AWS keys stored in GitHub).
 permissions:
-  id-token: write
   contents: read
 
 env:
-  # PLACEHOLDERS: must match your Terraform values (see `terraform output`).
-  AWS_REGION: ap-south-1                    # REPLACE: your AWS region
-  ECR_REPOSITORY: inventory-backend         # REPLACE: terraform output ecr_repository_name
-  ECS_CLUSTER: inventory-cluster            # REPLACE: terraform output ecs_cluster_name
-  ECS_SERVICE: inventory-backend-service    # REPLACE: terraform output ecs_service_name
-  ECS_TASK_FAMILY: inventory-backend        # REPLACE: terraform output ecs_task_family
-  CONTAINER_NAME: backend                   # must match the container name in terraform/main.tf
-  FRONTEND_BUCKET: inventory-frontend-REPLACE_ME   # REPLACE: terraform output frontend_bucket_name
-  CLOUDFRONT_DISTRIBUTION_ID: REPLACE_ME    # REPLACE: terraform output frontend_distribution_id
+  AWS_REGION: ap-south-1 # REPLACE: match terraform/terraform.tfvars
+  ECR_REPOSITORY: inventory-backend # REPLACE: terraform output -raw ecr_repository_name
+  EC2_INSTANCE_ID: i-08aff518487606e8a # REPLACE: terraform output -raw ec2_instance_id
+  BACKEND_API_URL: http://ec2-13-233-64-77.ap-south-1.compute.amazonaws.com # REPLACE: http:// + terraform output -raw ec2_public_dns
+  FRONTEND_ORIGIN: http://inventory-frontend-166828110108.s3-website.ap-south-1.amazonaws.com # REPLACE: terraform output -raw frontend_url
+  FRONTEND_BUCKET: inventory-frontend-166828110108 # REPLACE: terraform output -raw frontend_bucket_name
 
 jobs:
   test:
@@ -31,24 +25,39 @@ jobs:
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: backend/package-lock.json
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
       - name: Install and test backend
         working-directory: backend
         run: |
           npm ci
           npm test
+      - name: Install and build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
 
   deploy:
     needs: test
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          # REPLACE: add repo secret AWS_DEPLOY_ROLE_ARN = terraform output github_actions_role_arn
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
@@ -56,46 +65,101 @@ jobs:
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push Docker image
-        id: image
+      - uses: docker/setup-qemu-action@v3
+        name: Set up QEMU
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+        name: Set up Docker Buildx
+
+      - name: Build and push backend image
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
-          TAG: ${{ github.sha }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -f docker/Dockerfile -t "$REGISTRY/$ECR_REPOSITORY:$TAG" ./backend
-          docker push "$REGISTRY/$ECR_REPOSITORY:$TAG"
-          echo "image=$REGISTRY/$ECR_REPOSITORY:$TAG" >> "$GITHUB_OUTPUT"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --push \
+            -f docker/Dockerfile \
+            -t "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            ./backend
 
-      # Reuse the task definition Terraform created and only swap the image.
-      - name: Download current task definition
-        run: |
-          aws ecs describe-task-definition --task-definition "$ECS_TASK_FAMILY" \
-            --query taskDefinition > task-definition.json
-
-      - name: Render task definition with the new image
-        id: render
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
-        with:
-          task-definition: task-definition.json
-          container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ steps.image.outputs.image }}
-
-      - name: Deploy to ECS (Fargate)
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
-        with:
-          task-definition: ${{ steps.render.outputs.task-definition }}
-          service: ${{ env.ECS_SERVICE }}
-          cluster: ${{ env.ECS_CLUSTER }}
-          wait-for-service-stability: true
-
-      # Frontend deploy: API requests use the same CloudFront origin via /api/*.
       - name: Build and upload frontend
-        if: hashFiles('frontend/package.json') != ''
         working-directory: frontend
+        env:
+          VITE_API_URL: ${{ env.BACKEND_API_URL }}
         run: |
           npm ci
           npm run build
           aws s3 sync dist "s3://$FRONTEND_BUCKET" --delete
-          aws cloudfront create-invalidation \
-            --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
-            --paths "/index.html"
+
+      - name: Deploy backend through Systems Manager
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          PARAMETERS=$(jq -cn \
+            --arg tag "$IMAGE_TAG" \
+            --arg region "$AWS_REGION" \
+            --arg registry "$REGISTRY" \
+            --arg origin "$FRONTEND_ORIGIN" \
+            '{
+              commands: [
+                "set -euo pipefail",
+                "mkdir -p /opt/inventory",
+                "cd /opt/inventory",
+                "aws ecr get-login-password --region " + $region + " | docker login --username AWS --password-stdin " + $registry,
+                "sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=" + $tag + "/' .env",
+                "sed -i '/^CORS_ORIGINS=/d' backend.env && printf '\\nCORS_ORIGINS=%s\\n' " + ($origin | @sh) + " >> backend.env",
+                "docker compose --profile backend pull backend",
+                "docker compose --profile backend up -d backend nginx",
+                "for attempt in $(seq 1 30); do if curl --fail --silent http://127.0.0.1/health; then exit 0; fi; sleep 2; done; docker compose logs --tail=100 backend; exit 1"
+              ]
+            }')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy inventory backend ${IMAGE_TAG}" \
+            --parameters "$PARAMETERS" \
+            --query "Command.CommandId" \
+            --output text)
+          echo "SSM command: $COMMAND_ID"
+
+          for attempt in $(seq 1 60); do
+            if STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query "Status" \
+              --output text 2>/dev/null); then
+              echo "SSM deployment status: $STATUS"
+              case "$STATUS" in
+                Success)
+                  aws ssm get-command-invocation \
+                    --command-id "$COMMAND_ID" \
+                    --instance-id "$EC2_INSTANCE_ID" \
+                    --query "StandardOutputContent" \
+                    --output text
+                  exit 0
+                  ;;
+                Failed|TimedOut|Cancelled|Cancelling|DeliveryTimedOut|ExecutionTimedOut|Undeliverable|Terminated)
+                  aws ssm get-command-invocation \
+                    --command-id "$COMMAND_ID" \
+                    --instance-id "$EC2_INSTANCE_ID" \
+                    --query "{stdout:StandardOutputContent,stderr:StandardErrorContent}" \
+                    --output json
+                  exit 1
+                  ;;
+              esac
+            fi
+            sleep 10
+          done
+
+          echo "Timed out waiting for SSM command $COMMAND_ID to finish."
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$EC2_INSTANCE_ID" \
+            --query "{status:Status,stdout:StandardOutputContent,stderr:StandardErrorContent}" \
+            --output json || true
+          exit 1

@@ -1,13 +1,13 @@
 # Cloud-Based Inventory Management System
 
-Inventory management system with a React/Vite frontend and a Node.js/Express backend, backed by DynamoDB and SNS, with Docker, ECS/Fargate, Terraform, and GitHub Actions.
+Inventory management system with a React/Vite frontend and a Node.js/Express backend, backed by DynamoDB and SNS. Terraform provisions a single EC2 backend, S3 website hosting, ECR, CloudWatch, and GitHub OIDC deployment.
 
 ## Layout
 
 ```
 backend/              Express API (src/, tests/, scripts/)
-docker/               Dockerfile + docker-compose.yml (local stack with DynamoDB Local)
-terraform/            AWS infrastructure (ECR, ECS/Fargate, ALB, DynamoDB, SNS, CloudWatch, S3/CloudFront, GitHub OIDC role)
+docker/               Dockerfile + local Compose stack, plus EC2 Compose/Nginx/cloud-init files
+terraform/            AWS infrastructure (EC2, ECR, DynamoDB, SNS, CloudWatch, S3 website, GitHub OIDC role)
 .github/workflows/    CI/CD pipeline
 frontend/             React + Vite inventory dashboard
 ```
@@ -16,7 +16,7 @@ frontend/             React + Vite inventory dashboard
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | Health check (ALB / Docker) |
+| GET | `/health` | Health check (EC2 Nginx / Docker) |
 | GET | `/api/products?category=&lowStockOnly=true` | List products |
 | POST | `/api/products` | Create product |
 | GET / PUT / DELETE | `/api/products/:id` | Read / update details / delete (`:id` = SKU) |
@@ -53,31 +53,128 @@ Open the Vite URL shown in the terminal (usually `http://localhost:5173`). Set `
 
 ## Deploy to AWS
 
-The frontend is served by CloudFront, which also proxies `/api/*` to the load balancer. This keeps browser API requests on the same HTTPS origin and avoids needing a custom domain or an API certificate.
+The frontend is hosted by the public S3 website endpoint over HTTP. The React app calls the EC2 Nginx API over HTTP using `VITE_API_URL`; the backend CORS origin is set to the exact S3 website origin. Port 80 on EC2 and frontend object reads are public. The backend container remains private to the Docker network. Use SSM Session Manager for administration and deployments; SSH is not required.
 
-1. Install and configure the AWS CLI and Terraform, and create an empty GitHub repository. Do not push this project's `main` branch yet; that push starts the deployment workflow, which needs the AWS resources and GitHub settings from the following steps. In the AWS console, confirm the account has a default VPC in the deployment region.
-2. Copy `terraform/terraform.tfvars.example` to `terraform/terraform.tfvars`. Set `aws_region`, your alert email, and `github_repo` (`owner/repository`). If your AWS account already has a GitHub Actions OIDC provider, set `create_github_oidc_provider = false`. Keep `desired_count = 0` for the first apply so ECS does not try to start before the first image is published.
-3. Run `cd terraform && terraform init && terraform plan && terraform apply`. Review the plan and confirm it in AWS. Confirm the SNS subscription email when it arrives. The first apply creates the infrastructure and CloudFront distribution, but keeps the backend task count at zero.
-4. Push an initial backend image to the ECR repository Terraform created. From the repository root, set `AWS_REGION` to the region in `terraform.tfvars`, then run:
+1. **Install tools and prepare GitHub.** Install AWS CLI v2, Terraform 1.5+, Docker, and `jq`. Create an empty GitHub repository and prepare the local `main` branch; wait to push it until workflow settings are configured. Confirm the AWS account has a default VPC with a public subnet in the deployment region.
+2. **Configure credentials.** Use an IAM Identity Center user assigned an appropriate permission set; do not use root credentials. For example:
+
+   ```bash
+   aws configure sso --profile inventory-admin
+   aws sso login --profile inventory-admin
+   export AWS_PROFILE=inventory-admin
+   aws sts get-caller-identity
+   ```
+
+   Verify the identity is the intended deployment role and not root.
+3. **Configure Terraform.** Copy `terraform/terraform.tfvars.example` to `terraform/terraform.tfvars`. Set a real `alert_email`, `github_repo` as `owner/repository` (without `.git`), and the region. The defaults use a `t3.micro`, latest Amazon Linux 2023 AMI, and encrypted 12 GiB gp3 root volume. Free Tier eligibility depends on your account. Leave `admin_cidr` and `ssh_key_name` empty to use SSM instead of SSH. Set both only if optional SSH access is required. Set `create_github_oidc_provider = false` if the account already has the GitHub OIDC provider.
+4. **Initialize, review, and create the infrastructure.**
+
+   ```bash
+   terraform -chdir=terraform init
+   terraform -chdir=terraform plan
+   terraform -chdir=terraform apply
+   ```
+
+   Review the plan before approving. The current state contains the CloudFront API cache policy and S3 origin access control, which Terraform will destroy; no CloudFront distribution is tracked in this state. The S3 bucket should remain but its public-access settings and policy will change, with website hosting added. EC2, DynamoDB, ECR, SNS, CloudWatch resources, and GitHub OIDC provider/role should be retained, not replaced. If Terraform proposes replacing or destroying the EC2 instance, DynamoDB table, ECR repository, SNS topic, or S3 bucket, stop and inspect the plan before applying. Confirm the SNS email subscription.
+5. **Seed ECR and deploy the first backend image.** From the repository root:
 
    ```bash
    AWS_REGION=ap-south-1 # change to the region in terraform.tfvars
-   cd terraform
-   ECR_URI=$(terraform output -raw ecr_repository_url)
-   cd ..
-   REGISTRY_HOST=$(printf '%s' "$ECR_URI" | cut -d/ -f1)
-   aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$REGISTRY_HOST"
-   docker build -f docker/Dockerfile -t "$ECR_URI:latest" ./backend
-   docker push "$ECR_URI:latest"
+   ECR_URI=$(terraform -chdir=terraform output -raw ecr_repository_url)
+   REGISTRY_HOST=${ECR_URI%%/*}
+   INSTANCE_ID=$(terraform -chdir=terraform output -raw ec2_instance_id)
+   aws ecr get-login-password --region "$AWS_REGION" |
+     docker login --username AWS --password-stdin "$REGISTRY_HOST"
+   docker build -f docker/Dockerfile -t "$ECR_URI:bootstrap" ./backend
+   docker push "$ECR_URI:bootstrap"
    ```
-5. In the GitHub repository, add the Actions secret `AWS_DEPLOY_ROLE_ARN` using `terraform output -raw github_actions_role_arn`. Update the region and the ECR, ECS, frontend bucket, and CloudFront distribution ID values in `.github/workflows/ci-cd.yml` to match `terraform output` values. Leave `VITE_API_URL` unset; the frontend uses same-origin `/api` requests.
-6. In `terraform/terraform.tfvars`, set `cors_origins` to the `frontend_url` output (for example, `https://d123example.cloudfront.net`) and set `desired_count = 1`. Run `terraform plan && terraform apply` to start the backend using the initial image.
-7. Push the project to `main`. GitHub Actions will test the backend, build and push the API image, deploy it to ECS, then build and upload the frontend. Check the Actions run, then open `terraform output -raw frontend_url`.
-8. When you're finished, set `desired_count = 0` and run `terraform apply` to stop Fargate tasks. Use `terraform destroy` to remove the demo infrastructure entirely. The load balancer and other resources can incur charges even when the task count is zero.
+
+   This local bootstrap build uses your machine's Docker architecture. If deploying to an ARM instance, build and push a matching image instead (for example, `docker buildx build --platform linux/arm64 --push -f docker/Dockerfile -t "$ECR_URI:bootstrap" ./backend`). Subsequent GitHub Actions images support both AMD64 and ARM64.
+
+   User data installs Docker, the Compose plugin, and SSM, then starts Nginx. Wait until the instance is online in Systems Manager:
+
+   ```bash
+   aws ec2 describe-instance-status --instance-ids "$INSTANCE_ID" \
+     --include-all-instances --query 'InstanceStatuses[0].InstanceState.Name' --output text
+   aws ssm describe-instance-information \
+     --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+     --query 'InstanceInformationList[0].PingStatus' --output text
+   ```
+
+   Get the S3 website origin for CORS:
+
+   ```bash
+   FRONTEND_ORIGIN=$(terraform -chdir=terraform output -raw frontend_url)
+   echo "$FRONTEND_ORIGIN"
+   ```
+
+   Deploy the bootstrap image through SSM (the EC2 instance role authenticates to ECR):
+
+   ```bash
+   PARAMETERS=$(jq -cn \
+     --arg region "$AWS_REGION" \
+     --arg registry "$REGISTRY_HOST" \
+     --arg origin "$FRONTEND_ORIGIN" \
+     '{
+       commands: [
+         "set -euo pipefail",
+         "sudo mkdir -p /opt/inventory",
+         "sudo chown \"$(whoami)\" /opt/inventory",
+         "cd /opt/inventory",
+         "aws ecr get-login-password --region " + $region + " | docker login --username AWS --password-stdin " + $registry,
+         "sed -i '\''s/^IMAGE_TAG=.*/IMAGE_TAG=bootstrap/'\'' .env",
+         "sed -i '\''/^CORS_ORIGINS=/d'\'' backend.env && printf '\\''\\nCORS_ORIGINS=%s\\n'\\'' " + ($origin | @sh) + " >> backend.env",
+         "docker compose --profile backend pull backend",
+         "docker compose --profile backend up -d backend nginx",
+         "for attempt in $(seq 1 30); do if curl --fail --silent http://127.0.0.1/health; then exit 0; fi; sleep 2; done; docker compose logs --tail=100 backend; exit 1"
+       ]
+     }')
+   COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" \
+     --document-name AWS-RunShellScript --parameters "$PARAMETERS" \
+     --query 'Command.CommandId' --output text)
+   echo "SSM command: $COMMAND_ID"
+   ```
+
+   Wait for the command to finish with status `Success` and inspect its output:
+
+   ```bash
+   aws ssm get-command-invocation --command-id "$COMMAND_ID" \
+     --instance-id "$INSTANCE_ID" \
+     --query '{status:Status,stdout:StandardOutputContent,stderr:StandardErrorContent}'
+   ```
+
+6. **Configure GitHub OIDC and workflow settings.** The Terraform role trusts only the configured repository's `main` branch. Set `AWS_REGION`, `ECR_REPOSITORY`, `EC2_INSTANCE_ID`, `BACKEND_API_URL` (`http://` plus the EC2 public DNS), `FRONTEND_ORIGIN` (the `frontend_url` output), and `FRONTEND_BUCKET` in `.github/workflows/ci-cd.yml`. In GitHub **Settings → Secrets and variables → Actions → Secrets**, add `AWS_DEPLOY_ROLE_ARN` using:
+
+   ```bash
+   terraform -chdir=terraform output -raw github_actions_role_arn
+   ```
+
+   No AWS access keys are needed in GitHub. The workflow sets `VITE_API_URL` to `BACKEND_API_URL` when building the frontend and updates backend CORS using `FRONTEND_ORIGIN`.
+7. **Deploy application updates.** Push to `main`. GitHub Actions installs dependencies, runs backend tests and the frontend build, pushes a backend image tagged with the commit SHA, syncs the frontend build to S3, then deploys the image to EC2 using SSM. The workflow waits for SSM completion and fails unless the remote health check succeeds. Open the `frontend_url` Terraform output.
+8. **Test and inspect the deployment.**
+
+   ```bash
+   FRONTEND_URL=$(terraform -chdir=terraform output -raw frontend_url)
+   BACKEND_API_URL="http://$(terraform -chdir=terraform output -raw ec2_public_dns)"
+   curl --fail "$FRONTEND_URL"
+   curl --fail "$BACKEND_API_URL/health"
+   curl --fail "$BACKEND_API_URL/api/dashboard"
+   curl --fail "$BACKEND_API_URL/api/products"
+   aws ssm start-session --target "$INSTANCE_ID"
+   ```
+
+   In the SSM session, inspect `sudo docker ps`, `cd /opt/inventory && sudo docker compose --profile backend logs --tail=100`, or `/var/log/inventory-bootstrap.log`. Follow backend logs locally:
+
+   ```bash
+   aws logs tail "/ecs/inventory-backend" --since 15m --follow
+   ```
+
+   The existing CloudWatch log group name is retained to preserve its history.
+9. **Clean up.** Run `terraform -chdir=terraform destroy` after the demo. This removes EC2, ECR, and other managed resources; it also deletes the DynamoDB table and inventory data, so export anything you need first. EC2, public IPv4, EBS, CloudWatch, S3 storage/requests, ECR, DynamoDB, and SNS may incur charges. Free Tier benefits are account-dependent; zero cost is not guaranteed. No NAT Gateway, Elastic IP, or CDN is provisioned.
 
 ## Placeholders to replace (search for `REPLACE`)
 
-- `backend/.env.example`: region, `SNS_TOPIC_ARN`, `CORS_ORIGINS`
-- `terraform/variables.tf` / `terraform.tfvars`: `alert_email`, `github_repo`, optional `acm_certificate_arn`, `cors_origins`
-- `.github/workflows/ci-cd.yml`: region, resource names, `FRONTEND_BUCKET`, `AWS_DEPLOY_ROLE_ARN` secret
+- `backend/.env.example`: region, `SNS_TOPIC_ARN`, `CORS_ORIGINS` (used for local development)
+- `terraform/terraform.tfvars`: `alert_email`, `github_repo`, optional `instance_type`, `ami_id`, `root_volume_size`, `admin_cidr`, `ssh_key_name`
+- `.github/workflows/ci-cd.yml`: region, `ECR_REPOSITORY`, `EC2_INSTANCE_ID`, `BACKEND_API_URL`, `FRONTEND_ORIGIN`, `FRONTEND_BUCKET`, `AWS_DEPLOY_ROLE_ARN` secret
 - `terraform/main.tf`: optional remote state backend block
