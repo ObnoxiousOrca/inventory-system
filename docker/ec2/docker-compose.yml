@@ -20,7 +20,7 @@ services:
       options:
         awslogs-region: ${AWS_REGION}
         awslogs-group: ${CLOUDWATCH_LOG_GROUP}
-        awslogs-stream-prefix: backend
+        awslogs-stream: backend
         awslogs-create-group: "false"
 
   nginx:

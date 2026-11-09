@@ -107,7 +107,8 @@ jobs:
             '{
               commands: [
                 "set -euo pipefail",
-                "mkdir -p /opt/inventory",
+                "sudo mkdir -p /opt/inventory",
+                "sudo chown \"$(whoami)\" /opt/inventory",
                 "cd /opt/inventory",
                 "aws ecr get-login-password --region " + $region + " | docker login --username AWS --password-stdin " + $registry,
                 "sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=" + $tag + "/' .env",

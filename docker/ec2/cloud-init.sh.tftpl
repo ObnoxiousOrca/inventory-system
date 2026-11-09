@@ -3,7 +3,7 @@ set -euo pipefail
 
 exec > >(tee -a /var/log/inventory-bootstrap.log | logger -t inventory-bootstrap -s 2>/dev/console) 2>&1
 
-dnf install -y docker awscli-2 curl
+dnf install -y docker awscli-2
 systemctl enable --now docker
 systemctl enable --now amazon-ssm-agent
 
